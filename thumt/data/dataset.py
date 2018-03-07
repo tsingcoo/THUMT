@@ -146,9 +146,10 @@ def get_training_input(filenames, params):
         features["target"] = tgt_table.lookup(features["target"])
 
         # Batching
+        shard_multiplier = len(params.device_list) * params.update_cycle
         features = batch_examples(features, params.batch_size,
                                   params.max_length, params.mantissa_bits,
-                                  shard_multiplier=len(params.device_list),
+                                  shard_multiplier=shard_multiplier,
                                   length_multiplier=params.length_multiplier,
                                   constant=params.constant_batch_size,
                                   num_threads=params.num_threads)
@@ -258,56 +259,52 @@ def get_evaluation_input(inputs, params):
         iterator = dataset.make_one_shot_iterator()
         features = iterator.get_next()
 
+        # Covert source symbols to ids
         src_table = tf.contrib.lookup.index_table_from_tensor(
             tf.constant(params.vocabulary["source"]),
             default_value=params.mapping["source"][params.unk]
         )
-        tgt_table = tf.contrib.lookup.index_table_from_tensor(
-            tf.constant(params.vocabulary["target"]),
-            default_value=params.mapping["target"][params.unk]
-        )
+
         features["source"] = src_table.lookup(features["source"])
-        features["references"] = tuple(
-            tgt_table.lookup(item) for item in features["references"]
-        )
 
     return features
 
 
 def get_inference_input(inputs, params):
-    dataset = tf.data.Dataset.from_tensor_slices(
-        tf.constant(inputs)
-    )
+    with tf.device("/cpu:0"):
+        dataset = tf.data.Dataset.from_tensor_slices(
+            tf.constant(inputs)
+        )
 
-    # Split string
-    dataset = dataset.map(lambda x: tf.string_split([x]).values,
-                          num_parallel_calls=params.num_threads)
+        # Split string
+        dataset = dataset.map(lambda x: tf.string_split([x]).values,
+                              num_parallel_calls=params.num_threads)
 
-    # Append <eos>
-    dataset = dataset.map(
-        lambda x: tf.concat([x, [tf.constant(params.eos)]], axis=0),
-        num_parallel_calls=params.num_threads
-    )
+        # Append <eos>
+        dataset = dataset.map(
+            lambda x: tf.concat([x, [tf.constant(params.eos)]], axis=0),
+            num_parallel_calls=params.num_threads
+        )
 
-    # Convert tuple to dictionary
-    dataset = dataset.map(
-        lambda x: {"source": x, "source_length": tf.shape(x)[0]},
-        num_parallel_calls=params.num_threads
-    )
+        # Convert tuple to dictionary
+        dataset = dataset.map(
+            lambda x: {"source": x, "source_length": tf.shape(x)[0]},
+            num_parallel_calls=params.num_threads
+        )
 
-    dataset = dataset.padded_batch(
-        params.decode_batch_size,
-        {"source": [tf.Dimension(None)], "source_length": []},
-        {"source": params.pad, "source_length": 0}
-    )
+        dataset = dataset.padded_batch(
+            params.decode_batch_size * len(params.device_list),
+            {"source": [tf.Dimension(None)], "source_length": []},
+            {"source": params.pad, "source_length": 0}
+        )
 
-    iterator = dataset.make_one_shot_iterator()
-    features = iterator.get_next()
+        iterator = dataset.make_one_shot_iterator()
+        features = iterator.get_next()
 
-    src_table = tf.contrib.lookup.index_table_from_tensor(
-        tf.constant(params.vocabulary["source"]),
-        default_value=params.mapping["source"][params.unk]
-    )
-    features["source"] = src_table.lookup(features["source"])
+        src_table = tf.contrib.lookup.index_table_from_tensor(
+            tf.constant(params.vocabulary["source"]),
+            default_value=params.mapping["source"][params.unk]
+        )
+        features["source"] = src_table.lookup(features["source"])
 
-    return features
+        return features

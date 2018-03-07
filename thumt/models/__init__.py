@@ -15,9 +15,9 @@ def get_model(name):
 
     if name == "rnnsearch":
         return thumt.models.rnnsearch.RNNsearch
-    elif name == "transformer":
-        return thumt.models.transformer.Transformer
     elif name == "seq2seq":
         return thumt.models.seq2seq.Seq2Seq
+    elif name == "transformer":
+        return thumt.models.transformer.Transformer
     else:
         raise LookupError("Unknown model %s" % name)

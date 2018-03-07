@@ -8,17 +8,19 @@ from __future__ import print_function
 
 import argparse
 import os
+import six
 
 import numpy as np
 import tensorflow as tf
+import thumt.data.cache as cache
 import thumt.data.dataset as dataset
 import thumt.data.record as record
 import thumt.data.vocab as vocabulary
 import thumt.models as models
 import thumt.utils.hooks as hooks
-import thumt.utils.utils as utils
+import thumt.utils.inference as inference
+import thumt.utils.optimize as optimize
 import thumt.utils.parallel as parallel
-import thumt.utils.search as search
 
 
 def parse_args(args=None):
@@ -40,6 +42,8 @@ def parse_args(args=None):
                         help="Path of validation file")
     parser.add_argument("--references", type=str, nargs="+",
                         help="Path of reference files")
+    parser.add_argument("--checkpoint", type=str,
+                        help="Path to pre-trained checkpoint")
 
     # model and configuration
     parser.add_argument("--model", type=str, required=True,
@@ -59,28 +63,29 @@ def default_parameters():
         vocab=["", ""],
         # Default training hyper parameters
         num_threads=6,
-        batch_size=128,
+        batch_size=4096,
         max_length=256,
         length_multiplier=1,
         mantissa_bits=2,
         warmup_steps=4000,
         train_steps=100000,
         buffer_size=10000,
-        constant_batch_size=True,
+        constant_batch_size=False,
         device_list=[0],
         update_cycle=1,
-        initializer="uniform",
-        initializer_gain=0.08,
+        initializer="uniform_unit_scaling",
+        initializer_gain=1.0,
+        optimizer="Adam",
         adam_beta1=0.9,
         adam_beta2=0.999,
         adam_epsilon=1e-8,
         clip_grad_norm=5.0,
         learning_rate=1.0,
-        learning_rate_decay="noam",
+        learning_rate_decay="linear_warmup_rsqrt_decay",
         learning_rate_boundaries=[0],
         learning_rate_values=[0.0],
-        keep_checkpoint_max=5,
-        keep_top_checkpoint_max=1,
+        keep_checkpoint_max=20,
+        keep_top_checkpoint_max=5,
         # Validation
         eval_steps=2000,
         eval_secs=0,
@@ -89,12 +94,13 @@ def default_parameters():
         beam_size=4,
         decode_alpha=0.6,
         decode_length=50,
-        decode_constant=5.0,
-        decode_normalize=False,
         validation="",
         references=[""],
         save_checkpoint_secs=0,
         save_checkpoint_steps=1000,
+        # Setting this to True can save disk spaces, but cannot restore
+        # training using the saved checkpoint
+        only_save_trainable=False
     )
 
     return params
@@ -214,7 +220,7 @@ def get_initializer(params):
 
 
 def get_learning_rate_decay(learning_rate, global_step, params):
-    if params.learning_rate_decay == "noam":
+    if params.learning_rate_decay in ["linear_warmup_rsqrt_decay", "noam"]:
         step = tf.to_float(global_step)
         warmup_steps = tf.to_float(params.warmup_steps)
         multiplier = params.hidden_size ** -0.5
@@ -252,7 +258,10 @@ def decode_target_ids(inputs, params):
     for item in inputs:
         syms = []
         for idx in item:
-            sym = vocab[idx]
+            if isinstance(idx, six.integer_types):
+                sym = vocab[idx]
+            else:
+                sym = idx
 
             if sym == params.eos:
                 break
@@ -264,6 +273,35 @@ def decode_target_ids(inputs, params):
         decoded.append(syms)
 
     return decoded
+
+
+def restore_variables(checkpoint):
+    if not checkpoint:
+        return tf.no_op("restore_op")
+
+    # Load checkpoints
+    tf.logging.info("Loading %s" % checkpoint)
+    var_list = tf.train.list_variables(checkpoint)
+    reader = tf.train.load_checkpoint(checkpoint)
+    values = {}
+
+    for (name, shape) in var_list:
+        tensor = reader.get_tensor(name)
+        name = name.split(":")[0]
+        values[name] = tensor
+
+    var_list = tf.trainable_variables()
+    ops = []
+
+    for var in var_list:
+        name = var.name.split(":")[0]
+
+        if name in values:
+            tf.logging.info("Restore %s" % var.name)
+
+        ops.append(tf.assign(var, values[name]))
+
+    return tf.group(*ops, name="restore_op")
 
 
 def main(args):
@@ -295,6 +333,9 @@ def main(args):
             features = record.get_input_features(
                 os.path.join(params.record, "*train*"), "train", params
             )
+
+        features, init_op = cache.cache_features(features,
+                                                 params.update_cycle)
 
         # Build model
         initializer = get_initializer(params)
@@ -329,46 +370,21 @@ def main(args):
         tf.summary.scalar("learning_rate", learning_rate)
 
         # Create optimizer
-        opt = tf.train.AdamOptimizer(learning_rate,
-                                     beta1=params.adam_beta1,
-                                     beta2=params.adam_beta2,
-                                     epsilon=params.adam_epsilon)
-
-        if params.update_cycle == 1:
-            train_op = tf.contrib.layers.optimize_loss(
-                name="training",
-                loss=loss,
-                global_step=global_step,
-                learning_rate=learning_rate,
-                clip_gradients=params.clip_grad_norm or None,
-                optimizer=opt,
-                colocate_gradients_with_ops=True
-            )
-            zero_op = tf.no_op("zero_op")
-            collect_op = tf.no_op("collect_op")
+        if params.optimizer == "Adam":
+            opt = tf.train.AdamOptimizer(learning_rate,
+                                         beta1=params.adam_beta1,
+                                         beta2=params.adam_beta2,
+                                         epsilon=params.adam_epsilon)
+        elif params.optimizer == "LazyAdam":
+            opt = tf.contrib.opt.LazyAdamOptimizer(learning_rate,
+                                                   beta1=params.adam_beta1,
+                                                   beta2=params.adam_beta2,
+                                                   epsilon=params.adam_epsilon)
         else:
-            grads_and_vars = opt.compute_gradients(
-                loss, colocate_gradients_with_ops=True)
-            gradients = [item[0] for item in grads_and_vars]
-            variables = [item[1] for item in grads_and_vars]
+            raise RuntimeError("Optimizer %s not supported" % params.optimizer)
 
-            variables = utils.replicate_variables(variables)
-            zero_op = utils.zero_variables(variables)
-            collect_op = utils.collect_gradients(gradients, variables)
-
-            scale = 1.0 / params.update_cycle
-            gradients = utils.scale_gradients(variables, scale)
-
-            # Gradient clipping
-            if isinstance(params.clip_grad_norm or None, float):
-                gradients, _ = tf.clip_by_global_norm(gradients,
-                                                      params.clip_grad_norm)
-
-            # Update variables
-            grads_and_vars = list(zip(gradients, tf.trainable_variables()))
-
-            with tf.control_dependencies([collect_op]):
-                train_op = opt.apply_gradients(grads_and_vars, global_step)
+        loss, ops = optimize.create_train_op(loss, opt, global_step, params)
+        restore_op = restore_variables(args.checkpoint)
 
         # Validation
         if params.validation and params.references[0]:
@@ -379,6 +395,14 @@ def main(args):
             eval_input_fn = None
 
         # Add hooks
+        save_vars = tf.trainable_variables() + [global_step]
+        saver = tf.train.Saver(
+            var_list=save_vars if params.only_save_trainable else None,
+            max_to_keep=params.keep_checkpoint_max,
+            sharded=False
+        )
+        tf.add_to_collection(tf.GraphKeys.SAVERS, saver)
+
         train_hooks = [
             tf.train.StopAtStepHook(last_step=params.train_steps),
             tf.train.NanTensorHook(loss),
@@ -386,8 +410,6 @@ def main(args):
                 {
                     "step": global_step,
                     "loss": loss,
-                    "source": tf.shape(features["source"]),
-                    "target": tf.shape(features["target"])
                 },
                 every_n_iter=1
             ),
@@ -395,10 +417,7 @@ def main(args):
                 checkpoint_dir=params.output,
                 save_secs=params.save_checkpoint_secs or None,
                 save_steps=params.save_checkpoint_steps or None,
-                saver=tf.train.Saver(
-                    max_to_keep=params.keep_checkpoint_max,
-                    sharded=False
-                )
+                saver=saver
             )
         ]
 
@@ -407,8 +426,8 @@ def main(args):
         if eval_input_fn is not None:
             train_hooks.append(
                 hooks.EvaluationHook(
-                    lambda f: search.create_inference_graph(
-                        model.get_evaluation_func(), f, params
+                    lambda f: inference.create_inference_graph(
+                        [model.get_inference_func()], f, params
                     ),
                     lambda: eval_input_fn(eval_inputs, params),
                     lambda x: decode_target_ids(x, params),
@@ -420,16 +439,27 @@ def main(args):
                 )
             )
 
+        def restore_fn(step_context):
+            step_context.session.run(restore_op)
+
+        def step_fn(step_context):
+            # Bypass hook calls
+            step_context.session.run([init_op, ops["zero_op"]])
+            for i in range(params.update_cycle):
+                step_context.session.run(ops["collect_op"])
+            step_context.session.run(ops["scale_op"])
+
+            return step_context.run_with_hooks(ops["train_op"])
+
         # Create session, do not use default CheckpointSaverHook
         with tf.train.MonitoredTrainingSession(
                 checkpoint_dir=params.output, hooks=train_hooks,
                 save_checkpoint_secs=None, config=config) as sess:
+            # Restore pre-trained variables
+            sess.run_step_fn(restore_fn)
+
             while not sess.should_stop():
-                # Bypass hook calls
-                utils.session_run(sess, zero_op)
-                for i in range(1, params.update_cycle):
-                    utils.session_run(sess, collect_op)
-                sess.run(train_op)
+                sess.run_step_fn(step_fn)
 
 
 if __name__ == "__main__":

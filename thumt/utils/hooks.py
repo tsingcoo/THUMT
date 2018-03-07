@@ -5,6 +5,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import datetime
 import operator
 import os
 
@@ -24,6 +25,15 @@ def _get_saver():
         raise RuntimeError("More than one item in collection")
 
     return savers[0]
+
+
+def _save_log(filename, result):
+    metric, global_step, score = result
+
+    with open(filename, "a") as fd:
+        time = datetime.datetime.now()
+        msg = "%s: %s at step %d: %f\n" % (time, metric, global_step, score)
+        fd.write(msg)
 
 
 def _read_checkpoint_def(filename):
@@ -125,11 +135,12 @@ def _evaluate(eval_fn, input_fn, decode_fn, path, config):
     with graph.as_default():
         features = input_fn()
         refs = features["references"]
-        predictions = eval_fn(features)
-        results = {
-            "predictions": predictions,
-            "references": refs
+        placeholders = {
+            "source": tf.placeholder(tf.int32, [None, None], "source"),
+            "source_length": tf.placeholder(tf.int32, [None], "source_length")
         }
+        predictions = eval_fn(placeholders)
+        predictions = predictions[0][:, 0, :]
 
         all_refs = [[] for _ in range(len(refs))]
         all_outputs = []
@@ -141,13 +152,17 @@ def _evaluate(eval_fn, input_fn, decode_fn, path, config):
 
         with tf.train.MonitoredSession(session_creator=sess_creator) as sess:
             while not sess.should_stop():
-                outputs = sess.run(results)
+                feats = sess.run(features)
+                outputs = sess.run(predictions, feed_dict={
+                    placeholders["source"]: feats["source"],
+                    placeholders["source_length"]: feats["source_length"]
+                })
                 # shape: [batch, len]
-                predictions = outputs["predictions"].tolist()
+                outputs = outputs.tolist()
                 # shape: ([batch, len], ..., [batch, len])
-                references = [item.tolist() for item in outputs["references"]]
+                references = [item.tolist() for item in feats["references"]]
 
-                all_outputs.extend(predictions)
+                all_outputs.extend(outputs)
 
                 for i in range(len(refs)):
                     all_refs[i].extend(references[i])
@@ -189,6 +204,7 @@ class EvaluationHook(tf.train.SessionRunHook):
         self._session_config = session_config
         self._save_path = os.path.join(base_dir, "eval")
         self._record_name = os.path.join(self._save_path, "record")
+        self._log_name = os.path.join(self._save_path, "log")
         self._eval_fn = eval_fn
         self._eval_input_fn = eval_input_fn
         self._eval_decode_fn = eval_decode_fn
@@ -250,6 +266,8 @@ class EvaluationHook(tf.train.SessionRunHook):
                                   self._session_config)
                 tf.logging.info("%s at step %d: %f" %
                                 (self._metric, global_step, score))
+
+                _save_log(self._log_name, (self._metric, global_step, score))
 
                 checkpoint_filename = os.path.join(self._base_dir,
                                                    "checkpoint")

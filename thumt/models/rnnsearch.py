@@ -180,7 +180,7 @@ def _decoder(cell, inputs, memory, sequence_length, initial_state, dtype=None,
     return result
 
 
-def model_graph(features, labels, params):
+def model_graph(features, mode, params):
     src_vocab_size = len(params.vocabulary["source"])
     tgt_vocab_size = len(params.vocabulary["target"])
 
@@ -273,7 +273,7 @@ def model_graph(features, labels, params):
     ]
     maxout_size = params.hidden_size // params.maxnum
 
-    if labels is None:
+    if mode is "infer":
         # Special case for non-incremental decoding
         maxout_features = [
             shifted_tgt_inputs[:, -1, :],
@@ -289,7 +289,7 @@ def model_graph(features, labels, params):
         logits = layers.nn.linear(readout, tgt_vocab_size, True, False,
                                   scope="softmax")
 
-        return logits
+        return tf.nn.log_softmax(logits)
 
     maxhid = layers.nn.maxout(maxout_features, maxout_size, params.maxnum,
                               concat=False)
@@ -303,6 +303,7 @@ def model_graph(features, labels, params):
     logits = layers.nn.linear(readout, tgt_vocab_size, True, False,
                               scope="softmax")
     logits = tf.reshape(logits, [-1, tgt_vocab_size])
+    labels = features["target"]
 
     ce = layers.nn.smoothed_softmax_cross_entropy_with_logits(
         logits=logits,
@@ -319,22 +320,26 @@ def model_graph(features, labels, params):
         )
     )
 
+    if mode == "eval":
+        return -tf.reduce_sum(ce * tgt_mask, axis=1)
+
     loss = tf.reduce_sum(ce * tgt_mask) / tf.reduce_sum(tgt_mask)
 
     return loss
 
 
 class RNNsearch(interface.NMTModel):
+
     def __init__(self, params, scope="rnnsearch"):
         super(RNNsearch, self).__init__(params=params, scope=scope)
 
     def get_training_func(self, initializer):
-        def training_fn(features, params=None):
+        def training_fn(features, params=None, reuse=None):
             if params is None:
                 params = self.parameters
             with tf.variable_scope(self._scope, initializer=initializer,
-                                   reuse=tf.AUTO_REUSE):
-                loss = model_graph(features, features["target"], params)
+                                   reuse=reuse):
+                loss = model_graph(features, "train", params)
                 return loss
 
         return training_fn
@@ -345,14 +350,15 @@ class RNNsearch(interface.NMTModel):
                 params = copy.copy(self.parameters)
             else:
                 params = copy.copy(params)
+
             params.dropout = 0.0
             params.use_variational_dropout = False
             params.label_smoothing = 0.0
 
             with tf.variable_scope(self._scope):
-                logits = model_graph(features, None, params)
+                score = model_graph(features, "eval", params)
 
-            return logits
+            return score
 
         return evaluation_fn
 
@@ -362,14 +368,15 @@ class RNNsearch(interface.NMTModel):
                 params = copy.copy(self.parameters)
             else:
                 params = copy.copy(params)
+
             params.dropout = 0.0
             params.use_variational_dropout = False
             params.label_smoothing = 0.0
 
             with tf.variable_scope(self._scope):
-                logits = model_graph(features, None, params)
+                log_prob = model_graph(features, "infer", params)
 
-            return logits
+            return log_prob
 
         return inference_fn
 
